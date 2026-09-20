@@ -142,7 +142,8 @@ func TestResponseModifier(t *testing.T) {
 
 	t.Run("request log was stored in repository", func(t *testing.T) {
 		// Dirty (but simple) wait for other goroutine to finish calling repository.
-		time.Sleep(10 * time.Millisecond)
+		// The batched writer flushes on a short interval; allow enough slack.
+		time.Sleep(150 * time.Millisecond)
 
 		got, err := svc.FindRequestLogByID(context.Background(), reqLogID)
 		if err != nil {

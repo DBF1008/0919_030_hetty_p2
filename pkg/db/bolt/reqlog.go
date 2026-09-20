@@ -112,6 +112,10 @@ func (db *Database) FindRequestLogByID(ctx context.Context, projectID, reqLogID 
 	return reqLog, nil
 }
 
+// StoreRequestLog queues the request log for inclusion in a batched write
+// transaction. It blocks until the batch containing the log has been
+// committed (with retries on transient failures), preserving synchronous
+// durability for callers while avoiding a separate transaction per request.
 func (db *Database) StoreRequestLog(ctx context.Context, reqLog reqlog.RequestLog) error {
 	buf := bytes.Buffer{}
 
@@ -120,26 +124,31 @@ func (db *Database) StoreRequestLog(ctx context.Context, reqLog reqlog.RequestLo
 		return fmt.Errorf("bolt: failed to encode request log: %w", err)
 	}
 
-	err = db.bolt.Update(func(txn *bolt.Tx) error {
+	rawReqLog := append([]byte(nil), buf.Bytes()...)
+
+	err = db.enqueueWrite(ctx, func(txn *bolt.Tx) error {
 		b, err := requestLogsBucket(txn, reqLog.ProjectID)
 		if err != nil {
 			return fmt.Errorf("failed to get request logs bucket: %w", err)
 		}
 
-		err = b.Put(reqLog.ID[:], buf.Bytes())
-		if err != nil {
+		if err := b.Put(reqLog.ID[:], rawReqLog); err != nil {
 			return fmt.Errorf("failed to put request log: %w", err)
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("bolt: failed to commit transaction: %w", err)
+		return fmt.Errorf("bolt: failed to commit batch transaction: %w", err)
 	}
 
 	return nil
 }
 
+// StoreResponseLog queues the response log for inclusion in a batched write
+// transaction. The batch writer retries transient transaction failures, so
+// temporary Bolt errors no longer cause an asynchronous response store to be
+// lost silently.
 func (db *Database) StoreResponseLog(ctx context.Context, projectID, reqLogID ulid.ULID, resLog reqlog.ResponseLog) error {
 	buf := bytes.Buffer{}
 
@@ -148,7 +157,7 @@ func (db *Database) StoreResponseLog(ctx context.Context, projectID, reqLogID ul
 		return fmt.Errorf("bolt: failed to encode response log: %w", err)
 	}
 
-	err = db.bolt.Update(func(txn *bolt.Tx) error {
+	err = db.enqueueWrite(ctx, func(txn *bolt.Tx) error {
 		b, err := requestLogsBucket(txn, projectID)
 		if err != nil {
 			return fmt.Errorf("failed to get request logs bucket: %w", err)
@@ -167,13 +176,13 @@ func (db *Database) StoreResponseLog(ctx context.Context, projectID, reqLogID ul
 
 		reqLog.Response = &resLog
 
-		buf := bytes.Buffer{}
-		err = gob.NewEncoder(&buf).Encode(reqLog)
+		encodedReqLog := bytes.Buffer{}
+		err = gob.NewEncoder(&encodedReqLog).Encode(reqLog)
 		if err != nil {
 			return fmt.Errorf("failed to encode request log: %w", err)
 		}
 
-		err = b.Put(reqLog.ID[:], buf.Bytes())
+		err = b.Put(reqLog.ID[:], encodedReqLog.Bytes())
 		if err != nil {
 			return fmt.Errorf("failed to put request log: %w", err)
 		}
@@ -181,23 +190,39 @@ func (db *Database) StoreResponseLog(ctx context.Context, projectID, reqLogID ul
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("bolt: failed to commit transaction: %w", err)
+		return fmt.Errorf("bolt: failed to commit batch transaction: %w", err)
 	}
 
 	return nil
 }
 
+// ClearRequestLogs first flushes any buffered writes so nothing outlives the
+// clear operation, then synchronously deletes (and recreates) the request
+// logs bucket.
 func (db *Database) ClearRequestLogs(ctx context.Context, projectID ulid.ULID) error {
-	err := db.bolt.Update(func(txn *bolt.Tx) error {
+	if err := db.Flush(ctx); err != nil {
+		return fmt.Errorf("bolt: failed to flush batched writes: %w", err)
+	}
+
+	err := db.enqueueWrite(ctx, func(txn *bolt.Tx) error {
 		pb, err := projectBucket(txn, projectID[:])
 		if err != nil {
 			return fmt.Errorf("failed to get project bucket: %w", err)
 		}
 
-		return pb.DeleteBucket(reqLogsBucketName)
+		// Tolerate a missing bucket so clearing is idempotent.
+		if err := pb.DeleteBucket(reqLogsBucketName); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
+			return fmt.Errorf("failed to delete request logs bucket: %w", err)
+		}
+
+		if _, err := pb.CreateBucketIfNotExists(reqLogsBucketName); err != nil {
+			return fmt.Errorf("failed to recreate request logs bucket: %w", err)
+		}
+
+		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("bolt: failed to commit transaction: %w", err)
+		return fmt.Errorf("bolt: failed to commit batch transaction: %w", err)
 	}
 
 	return nil
