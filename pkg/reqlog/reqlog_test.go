@@ -1,6 +1,7 @@
 package reqlog_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"math/rand"
@@ -62,6 +63,10 @@ func TestRequestModifier(t *testing.T) {
 	req = req.WithContext(proxy.WithRequestID(req.Context(), reqID))
 
 	reqModFn(req)
+
+	// Request logs are stored via the repository's async batch writer;
+	// flush to make sure the write has been committed.
+	db.Flush()
 
 	t.Run("request log was stored in repository", func(t *testing.T) {
 		exp := reqlog.RequestLog{
@@ -140,10 +145,11 @@ func TestResponseModifier(t *testing.T) {
 		t.Fatalf("unexpected error (expected: nil, got: %v)", err)
 	}
 
-	t.Run("request log was stored in repository", func(t *testing.T) {
-		// Dirty (but simple) wait for other goroutine to finish calling repository.
-		time.Sleep(10 * time.Millisecond)
+	// Response logs are stored via the repository's async batch writer;
+	// flush to make sure the write has been committed.
+	db.Flush()
 
+	t.Run("request log was stored in repository", func(t *testing.T) {
 		got, err := svc.FindRequestLogByID(context.Background(), reqLogID)
 		if err != nil {
 			t.Fatalf("failed to find request by id: %v", err)
@@ -154,5 +160,156 @@ func TestResponseModifier(t *testing.T) {
 				t.Fatalf("incorrect `ResponseLog.Body` value (expected: %v, got: %v)", exp, string(got.Response.Body))
 			}
 		})
+	})
+}
+
+//nolint:paralleltest
+func TestRequestModifierBodyLimit(t *testing.T) {
+	path := t.TempDir() + "bolt.db"
+	boltDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("failed to open bolt database: %v", err)
+	}
+	defer boltDB.Close()
+
+	db, err := bolt.DatabaseFromBoltDB(boltDB)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	projectID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	err = db.UpsertProject(context.Background(), proj.Project{
+		ID: projectID,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error upserting project: %v", err)
+	}
+
+	svc := reqlog.NewService(reqlog.Config{
+		Repository: db,
+		Scope:      &scope.Scope{},
+	})
+	svc.SetActiveProjectID(projectID)
+
+	fullBody := make([]byte, reqlog.MaxBodyLogSize+100)
+	for i := range fullBody {
+		fullBody[i] = 'a'
+	}
+
+	reqModFn := svc.RequestModifier(func(req *http.Request) {})
+	req := httptest.NewRequest("POST", "https://example.com/", bytes.NewReader(fullBody))
+	reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	req = req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+
+	reqModFn(req)
+
+	db.Flush()
+
+	t.Run("stored request log body is truncated to the limit", func(t *testing.T) {
+		got, err := svc.FindRequestLogByID(context.Background(), reqID)
+		if err != nil {
+			t.Fatalf("failed to find request by id: %v", err)
+		}
+
+		if exp := reqlog.MaxBodyLogSize; len(got.Body) != exp {
+			t.Fatalf("incorrect stored body length (expected: %v, got: %v)", exp, len(got.Body))
+		}
+	})
+
+	t.Run("downstream request body is left intact", func(t *testing.T) {
+		got, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("failed to read request body: %v", err)
+		}
+
+		if exp := len(fullBody); len(got) != exp {
+			t.Fatalf("incorrect downstream body length (expected: %v, got: %v)", exp, len(got))
+		}
+	})
+}
+
+//nolint:paralleltest
+func TestResponseModifierBodyLimit(t *testing.T) {
+	path := t.TempDir() + "bolt.db"
+	boltDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("failed to open bolt database: %v", err)
+	}
+	defer boltDB.Close()
+
+	db, err := bolt.DatabaseFromBoltDB(boltDB)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	projectID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	err = db.UpsertProject(context.Background(), proj.Project{
+		ID: projectID,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error upserting project: %v", err)
+	}
+
+	svc := reqlog.NewService(reqlog.Config{
+		Repository: db,
+	})
+	svc.SetActiveProjectID(projectID)
+
+	reqLogID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	err = db.StoreRequestLog(context.Background(), reqlog.RequestLog{
+		ID:        reqLogID,
+		ProjectID: projectID,
+	})
+	if err != nil {
+		t.Fatalf("failed to store request log: %v", err)
+	}
+
+	fullBody := make([]byte, reqlog.MaxBodyLogSize+100)
+	for i := range fullBody {
+		fullBody[i] = 'b'
+	}
+
+	resModFn := svc.ResponseModifier(func(res *http.Response) error { return nil })
+
+	req := httptest.NewRequest("GET", "https://example.com/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), reqlog.ReqLogIDKey, reqLogID))
+
+	res := &http.Response{
+		Request: req,
+		Body:    io.NopCloser(bytes.NewReader(fullBody)),
+	}
+
+	if err := resModFn(res); err != nil {
+		t.Fatalf("unexpected error (expected: nil, got: %v)", err)
+	}
+
+	db.Flush()
+
+	t.Run("stored response log body is truncated to the limit", func(t *testing.T) {
+		got, err := svc.FindRequestLogByID(context.Background(), reqLogID)
+		if err != nil {
+			t.Fatalf("failed to find request by id: %v", err)
+		}
+
+		if got.Response == nil {
+			t.Fatal("expected response log to be stored, got: nil")
+		}
+
+		if exp := reqlog.MaxBodyLogSize; len(got.Response.Body) != exp {
+			t.Fatalf("incorrect stored body length (expected: %v, got: %v)", exp, len(got.Response.Body))
+		}
+	})
+
+	t.Run("downstream response body is left intact", func(t *testing.T) {
+		got, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatalf("failed to read response body: %v", err)
+		}
+
+		if exp := len(fullBody); len(got) != exp {
+			t.Fatalf("incorrect downstream body length (expected: %v, got: %v)", exp, len(got))
+		}
 	})
 }

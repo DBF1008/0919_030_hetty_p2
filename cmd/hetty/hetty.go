@@ -163,6 +163,8 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	}
 	defer boltDB.Close()
 
+	boltDB.SetBatchWriterLogger(cmd.config.logger.Named("reqlog-batch").Sugar())
+
 	scope := &scope.Scope{}
 
 	reqLogService := reqlog.NewService(reqlog.Config{

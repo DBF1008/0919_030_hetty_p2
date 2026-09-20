@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math/rand"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,8 +22,23 @@ import (
 	"github.com/dstotijn/hetty/pkg/scope"
 )
 
+// ulidEntropy is a *rand.Rand guarded by a mutex, so it's safe for
+// concurrent use by parallel tests.
+//
 //nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+var ulidEntropy = &lockedEntropy{rand: rand.New(rand.NewSource(time.Now().UnixNano()))}
+
+type lockedEntropy struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (e *lockedEntropy) Read(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.rand.Read(p)
+}
 
 var regexpCompareOpt = cmp.Comparer(func(x, y *regexp.Regexp) bool {
 	switch {

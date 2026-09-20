@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 
@@ -29,6 +28,11 @@ var (
 	ErrRequestNotFound    = errors.New("reqlog: request not found")
 	ErrProjectIDMustBeSet = errors.New("reqlog: project ID must be set")
 )
+
+// MaxBodyLogSize is the maximum number of bytes of a request or response
+// body that gets stored in the request log. Bodies are read through an
+// io.LimitReader with this limit, so oversized bodies can't exhaust memory.
+const MaxBodyLogSize = 2 * 1024 * 1024 // 2 MiB
 
 type RequestLog struct {
 	ID        ulid.ULID
@@ -118,18 +122,20 @@ func (svc *Service) RequestModifier(next proxy.RequestModifyFunc) proxy.RequestM
 		var body []byte
 
 		if req.Body != nil {
-			// TODO: Use io.LimitReader.
 			var err error
 
-			body, err = ioutil.ReadAll(req.Body)
+			body, err = io.ReadAll(io.LimitReader(req.Body, MaxBodyLogSize))
 			if err != nil {
 				svc.logger.Errorw("Failed to read request body for logging.",
 					"error", err)
 				return
 			}
 
-			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
-			clone.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+			// Restore the full (untruncated) body for downstream handlers:
+			// the already-read (capped) prefix, followed by the remainder of
+			// the original body.
+			req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), req.Body))
+			clone.Body = io.NopCloser(bytes.NewReader(body))
 		}
 
 		// Bypass logging if no project is active.
@@ -205,25 +211,25 @@ func (svc *Service) ResponseModifier(next proxy.ResponseModifyFunc) proxy.Respon
 		clone := *res
 
 		if res.Body != nil {
-			// TODO: Use io.LimitReader.
-			body, err := io.ReadAll(res.Body)
+			body, err := io.ReadAll(io.LimitReader(res.Body, MaxBodyLogSize))
 			if err != nil {
 				return fmt.Errorf("reqlog: could not read response body: %w", err)
 			}
 
-			res.Body = io.NopCloser(bytes.NewBuffer(body))
-			clone.Body = io.NopCloser(bytes.NewBuffer(body))
+			res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), res.Body))
+			clone.Body = io.NopCloser(bytes.NewReader(body))
 		}
 
-		go func() {
-			if err := svc.storeResponse(context.Background(), reqLogID, &clone); err != nil {
-				svc.logger.Errorw("Failed to store response log.",
-					"error", err)
-			} else {
-				svc.logger.Debugw("Stored response log.",
-					"reqLogID", reqLogID.String())
-			}
-		}()
+		// The repository buffers and commits writes asynchronously (batched,
+		// with retries on commit failure), so this call doesn't block the
+		// response path on a database transaction.
+		if err := svc.storeResponse(context.Background(), reqLogID, &clone); err != nil {
+			svc.logger.Errorw("Failed to store response log.",
+				"error", err)
+		} else {
+			svc.logger.Debugw("Stored response log.",
+				"reqLogID", reqLogID.String())
+		}
 
 		return nil
 	}

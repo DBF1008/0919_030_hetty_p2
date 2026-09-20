@@ -3,8 +3,10 @@ package bolt_test
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -108,6 +110,10 @@ func TestFindRequestLogs(t *testing.T) {
 			}
 		}
 
+		// Request logs are stored via the async batch writer; flush to make
+		// sure the writes have been committed.
+		db.Flush()
+
 		filter := reqlog.FindRequestsFilter{
 			ProjectID: projectID,
 		}
@@ -138,4 +144,79 @@ func mustParseURL(t *testing.T, s string) *url.URL {
 	}
 
 	return u
+}
+
+func TestStoreRequestLogConcurrentBatch(t *testing.T) {
+	t.Parallel()
+
+	path := t.TempDir() + "bolt.db"
+	boltDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("failed to open bolt database: %v", err)
+	}
+
+	db, err := bolt.DatabaseFromBoltDB(boltDB)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer db.Close()
+
+	// Use a local entropy source: the shared ulidEntropy (a *rand.Rand) is
+	// not safe for concurrent use by parallel tests.
+	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	projectID := ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
+
+	err = db.UpsertProject(context.Background(), proj.Project{
+		ID: projectID,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error upserting project: %v", err)
+	}
+
+	const numLogs = 256
+
+	ids := make([]ulid.ULID, numLogs)
+	for i := range ids {
+		ids[i] = ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
+	}
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numLogs; i++ {
+		wg.Add(1)
+
+		go func(i int) {
+			defer wg.Done()
+
+			reqLog := reqlog.RequestLog{
+				ID:        ids[i],
+				ProjectID: projectID,
+				URL:       mustParseURL(t, "https://example.com/foobar"),
+				Method:    http.MethodGet,
+				Proto:     "HTTP/1.1",
+				Body:      []byte("foo"),
+			}
+
+			if err := db.StoreRequestLog(context.Background(), reqLog); err != nil {
+				t.Errorf("unexpected error storing request log: %v", err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Wait for the async batch writer to commit all buffered writes.
+	db.Flush()
+
+	got, err := db.FindRequestLogs(context.Background(), reqlog.FindRequestsFilter{
+		ProjectID: projectID,
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error finding request logs: %v", err)
+	}
+
+	if len(got) != numLogs {
+		t.Fatalf("incorrect number of stored request logs (expected: %v, got: %v)", numLogs, len(got))
+	}
 }

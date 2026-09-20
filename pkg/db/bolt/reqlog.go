@@ -120,7 +120,10 @@ func (db *Database) StoreRequestLog(ctx context.Context, reqLog reqlog.RequestLo
 		return fmt.Errorf("bolt: failed to encode request log: %w", err)
 	}
 
-	err = db.bolt.Update(func(txn *bolt.Tx) error {
+	// Submit the write to the batch writer, which commits buffered writes in
+	// a single transaction. This keeps high-concurrency request logging from
+	// serializing on BoltDB's write lock.
+	db.bw.submit(func(txn *bolt.Tx) error {
 		b, err := requestLogsBucket(txn, reqLog.ProjectID)
 		if err != nil {
 			return fmt.Errorf("failed to get request logs bucket: %w", err)
@@ -133,9 +136,6 @@ func (db *Database) StoreRequestLog(ctx context.Context, reqLog reqlog.RequestLo
 
 		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("bolt: failed to commit transaction: %w", err)
-	}
 
 	return nil
 }
@@ -148,7 +148,8 @@ func (db *Database) StoreResponseLog(ctx context.Context, projectID, reqLogID ul
 		return fmt.Errorf("bolt: failed to encode response log: %w", err)
 	}
 
-	err = db.bolt.Update(func(txn *bolt.Tx) error {
+	// Submit the write to the batch writer; see StoreRequestLog.
+	db.bw.submit(func(txn *bolt.Tx) error {
 		b, err := requestLogsBucket(txn, projectID)
 		if err != nil {
 			return fmt.Errorf("failed to get request logs bucket: %w", err)
@@ -180,9 +181,6 @@ func (db *Database) StoreResponseLog(ctx context.Context, projectID, reqLogID ul
 
 		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("bolt: failed to commit transaction: %w", err)
-	}
 
 	return nil
 }

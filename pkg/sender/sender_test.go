@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,8 +23,23 @@ import (
 	"github.com/dstotijn/hetty/pkg/sender"
 )
 
+// ulidEntropy is a *rand.Rand guarded by a mutex, so it's safe for
+// concurrent use by parallel tests.
+//
 //nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+var ulidEntropy = &lockedEntropy{rand: rand.New(rand.NewSource(time.Now().UnixNano()))}
+
+type lockedEntropy struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (e *lockedEntropy) Read(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.rand.Read(p)
+}
 
 var exampleURL = func() *url.URL {
 	u, err := url.Parse("https://example.com/foobar")
@@ -185,6 +201,10 @@ func TestCloneFromRequestLog(t *testing.T) {
 		if err := db.StoreRequestLog(context.Background(), reqLog); err != nil {
 			t.Fatalf("failed to store request log: %v", err)
 		}
+
+		// Request logs are stored via the async batch writer; flush to make
+		// sure the write has been committed.
+		db.Flush()
 
 		svc := sender.NewService(sender.Config{
 			ReqLogService: reqlog.NewService(reqlog.Config{
